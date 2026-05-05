@@ -1,3 +1,17 @@
+"""
+model_gnn.py — GNN Policy cho High-level CTDE (dùng với Ray RLlib PPO).
+
+Kiến trúc:
+  Input  : nodes (B, N, 7) + edge_index (B, 2, N²) + agent_idx (B, 1)
+  GNN    : 2 lớp GATConv (Graph Attention Network)
+  Output : action_out (B, 3) — delta_xyz cho drone agent_idx
+           value_out  (B,)   — giá trị trạng thái toàn đồ thị (centralized critic)
+
+CTDE đạt được vì:
+  - Critic (value_head) nhìn toàn bộ đồ thị → centralized training
+  - Actor (action_head) chỉ dùng embedding của node agent_idx → decentralized execution
+"""
+
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -7,89 +21,85 @@ from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from torch_geometric.nn import GATConv
 
 
-class DroneGNNModel(TorchModelV2, nn.Module):
+class HighLevelGNNModel(TorchModelV2, nn.Module):
+
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
         nn.Module.__init__(self)
 
-        # 7 features: pos(3) + vel(3) + battery(1)
-        in_channels = 7
-        hidden_dim = 64
+        in_channels = 7           # pos(3) + vel(3) + bat(1)
+        hidden_dim  = 64
+        heads       = 4
 
-        self.conv1 = GATConv(in_channels, hidden_dim, heads=2, concat=True)
-        self.conv2 = GATConv(hidden_dim * 2, hidden_dim, heads=1, concat=False)
+        # ── GNN layers (shared — dùng cho cả actor lẫn critic) ──
+        self.conv1 = GATConv(in_channels,       hidden_dim, heads=heads, concat=True,  dropout=0.1)
+        self.conv2 = GATConv(hidden_dim * heads, hidden_dim, heads=1,    concat=False, dropout=0.1)
+        self.norm1 = nn.LayerNorm(hidden_dim * heads)
+        self.norm2 = nn.LayerNorm(hidden_dim)
 
-        # Policy head
+        # ── Actor head: chỉ dùng embedding của 1 node (decentralized) ──
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, num_outputs)
+            nn.Linear(64, num_outputs),  # num_outputs = 3 (delta_xyz)
         )
 
-        # Value head
+        # ── Critic head: dùng MEAN embedding toàn đồ thị (centralized) ──
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
 
         self._last_value = None
 
     def forward(self, input_dict, state, seq_lens):
-        obs = input_dict["obs"]
-        nodes = obs["nodes"]           # (batch, num_drones, 7)
-        edge_index = obs["edge_index"] # (batch, 2, max_edges)
+        obs        = input_dict["obs"]
+        nodes      = obs["nodes"]       # (B, N, 7)
+        edge_index = obs["edge_index"]  # (B, 2, N²)
+        agent_idx  = obs["agent_idx"]   # (B, 1)
 
         batch_size = nodes.shape[0]
-        num_drones = nodes.shape[1]
-
-        # FIX: edge_index phải là long (int64) và contiguous
         edge_index = edge_index.long().contiguous()
 
-        out_actions = []
-        out_values = []
+        action_outs = []
+        value_outs  = []
 
         for b in range(batch_size):
-            x = nodes[b]        # (num_drones, 7)
-            edges = edge_index[b]  # (2, max_edges)
+            x     = nodes[b]         # (N, 7)
+            edges = edge_index[b]    # (2, N²)
+            idx   = int(agent_idx[b, 0].item())
 
-            # Lọc bỏ padding edges (cả src và dst đều = 0 là padding)
-            # Để tránh self-loop giả từ padding, chỉ giữ edges có src != dst
-            mask = edges[0] != edges[1]
-            valid_edges = edges[:, mask]  # (2, num_valid_edges)
+            # Lọc padding edges (src == dst là self-loop padding)
+            mask  = edges[0] != edges[1]
+            valid = edges[:, mask]
 
-            # Nếu không có edge nào hợp lệ, dùng self-loop để GATConv không bị lỗi
-            if valid_edges.shape[1] == 0:
-                self_loops = torch.arange(num_drones, device=x.device)
-                valid_edges = torch.stack([self_loops, self_loops], dim=0)
+            if valid.shape[1] == 0:
+                # Fallback: self-loop để GATConv không crash
+                n = x.shape[0]
+                loop = torch.arange(n, device=x.device)
+                valid = torch.stack([loop, loop])
 
-            h = torch.relu(self.conv1(x, valid_edges))
-            h = torch.relu(self.conv2(h, valid_edges))
+            # ── Message passing ─────────────────────────────────
+            h = self.conv1(x, valid)
+            h = torch.relu(self.norm1(h))
+            h = self.conv2(h, valid)
+            h = torch.relu(self.norm2(h))
+            # h shape: (N, hidden_dim)
 
-            # FIX: Mỗi agent là 1 sample trong batch của RLlib
-            # → lấy embedding của TẤT CẢ drone, stack lại
-            out_actions.append(self.action_head(h))   # (num_drones, num_outputs)
-            out_values.append(self.value_head(h))     # (num_drones, 1)
+            # ── Actor: embedding của drone idx ──────────────────
+            # Decentralized: chỉ lấy node của agent này
+            action_outs.append(self.action_head(h[idx]))  # (num_outputs,)
 
-        # FIX: RLlib gọi forward 1 lần per agent per batch
-        # batch_size ở đây = số agent * số env steps
-        # nodes shape (batch, num_drones, 7) vì env trả về toàn bộ graph cho mỗi agent
-        # Ta cần trả về (batch, num_outputs) — dùng embedding của drone tương ứng
-        # Nhưng vì shared policy, tất cả agent đều dùng chung model này
-        # và Ray sẽ gọi forward riêng cho từng agent → batch_size=N, num_drones=3
-        # → ta lấy mean embedding của các drone trong graph làm đại diện
-        # (hoặc có thể lấy embedding drone 0 nếu muốn local policy)
+            # ── Critic: mean toàn đồ thị ────────────────────────
+            # Centralized: tổng hợp thông tin toàn bộ swarm
+            global_h = h.mean(dim=0)  # (hidden_dim,)
+            value_outs.append(self.value_head(global_h))  # (1,)
 
-        # Stack: (batch, num_drones, num_outputs)
-        action_out = torch.stack(out_actions)   # (batch, num_drones, num_outputs)
-        values_out = torch.stack(out_values)     # (batch, num_drones, 1)
+        action_out = torch.stack(action_outs)            # (B, num_outputs)
+        self._last_value = torch.stack(value_outs).squeeze(-1)  # (B,)
 
-        # FIX: Lấy MEAN qua tất cả drone → (batch, num_outputs) và (batch,)
-        # Đây là centralized approach — mọi agent trong graph đều tạo ra cùng output
-        action_mean = action_out.mean(dim=1)     # (batch, num_outputs)
-        self._last_value = values_out.mean(dim=1).squeeze(-1)  # (batch,)
-
-        return action_mean, state
+        return action_out, state
 
     def value_function(self):
         return self._last_value
